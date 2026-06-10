@@ -187,7 +187,7 @@ impl PlannerBackend for FastNoisePlanner {
                 std::slice::from_raw_parts_mut(offset_values.as_mut_ptr(), offset_values.len())
             }
         };
-        let mut cursor = 0usize;
+        let mut cursor = 0u64;
         offset_values[0] = 0;
         for (index, query) in queries.iter().enumerate() {
             let meta_base = index * 3;
@@ -202,8 +202,10 @@ impl PlannerBackend for FastNoisePlanner {
                         step,
                     },
                 ) => {
-                    meta_values[meta_base] = *width as u32;
-                    meta_values[meta_base + 1] = *height as u32;
+                    let width_u32 = checked_u32_from_usize(*width, "query width")?;
+                    let height_u32 = checked_u32_from_usize(*height, "query height")?;
+                    meta_values[meta_base] = width_u32;
+                    meta_values[meta_base + 1] = height_u32;
                     meta_values[meta_base + 2] = 1;
                     float_values[float_base] = origin[0];
                     float_values[float_base + 1] = origin[1];
@@ -211,7 +213,7 @@ impl PlannerBackend for FastNoisePlanner {
                     float_values[float_base + 3] = step[0];
                     float_values[float_base + 4] = step[1];
                     float_values[float_base + 5] = 1.0;
-                    cursor += sample_count_2d(*width, *height);
+                    cursor = checked_offset_after_add(cursor, sample_count_2d(*width, *height)?)?;
                 }
                 (
                     GraphDimension::D3,
@@ -223,16 +225,22 @@ impl PlannerBackend for FastNoisePlanner {
                         step,
                     },
                 ) => {
-                    meta_values[meta_base] = *width as u32;
-                    meta_values[meta_base + 1] = *height as u32;
-                    meta_values[meta_base + 2] = *depth as u32;
+                    let width_u32 = checked_u32_from_usize(*width, "query width")?;
+                    let height_u32 = checked_u32_from_usize(*height, "query height")?;
+                    let depth_u32 = checked_u32_from_usize(*depth, "query depth")?;
+                    meta_values[meta_base] = width_u32;
+                    meta_values[meta_base + 1] = height_u32;
+                    meta_values[meta_base + 2] = depth_u32;
                     float_values[float_base] = origin[0];
                     float_values[float_base + 1] = origin[1];
                     float_values[float_base + 2] = origin[2];
                     float_values[float_base + 3] = step[0];
                     float_values[float_base + 4] = step[1];
                     float_values[float_base + 5] = step[2];
-                    cursor += sample_count_3d(*width, *height, *depth);
+                    cursor = checked_offset_after_add(
+                        cursor,
+                        sample_count_3d(*width, *height, *depth)?,
+                    )?;
                 }
                 (GraphDimension::D2, ChunkQuery::Grid3D { .. }) => unreachable!("2d query shape"),
                 (GraphDimension::D3, ChunkQuery::Grid2D { .. }) => unreachable!("3d query shape"),
@@ -646,8 +654,8 @@ impl CpuKernel for CombineKernel {
             CombineOp::Min => self.run_binary(packet, cancel, |a, b| a.min(b)),
             CombineOp::Max => self.run_binary(packet, cancel, |a, b| a.max(b)),
             CombineOp::Clamp => {
-                let [min_value, max_value] = expect_params(self.params.as_slice());
-                let input = expect_input(self.inputs.as_slice());
+                let [min_value, max_value] = expect_params(self.params.as_slice(), self.op)?;
+                let input = expect_input(self.inputs.as_slice())?;
                 packet.with_slices::<f32, _, _>([input, self.output], |buffers| {
                     let [values, out] = buffers;
                     for index in 0..out.len() {
@@ -660,8 +668,9 @@ impl CpuKernel for CombineKernel {
                 })
             }
             CombineOp::Remap => {
-                let [src_min, src_max, dst_min, dst_max] = expect_params(self.params.as_slice());
-                let input = expect_input(self.inputs.as_slice());
+                let [src_min, src_max, dst_min, dst_max] =
+                    expect_params(self.params.as_slice(), self.op)?;
+                let input = expect_input(self.inputs.as_slice())?;
                 packet.with_slices::<f32, _, _>([input, self.output], |buffers| {
                     let [values, out] = buffers;
                     for index in 0..out.len() {
@@ -680,8 +689,9 @@ impl CpuKernel for CombineKernel {
                 })
             }
             CombineOp::YGradient => {
-                let [y_min, y_max, out_min, out_max] = expect_params(self.params.as_slice());
-                let input = expect_input(self.inputs.as_slice());
+                let [y_min, y_max, out_min, out_max] =
+                    expect_params(self.params.as_slice(), self.op)?;
+                let input = expect_input(self.inputs.as_slice())?;
                 packet.with_slices::<f32, _, _>([input, SLOT_BASE_Y, self.output], |buffers| {
                     let [values, ys, out] = buffers;
                     for index in 0..out.len() {
@@ -711,7 +721,7 @@ impl CombineKernel {
         cancel: &CancelFlag,
         op: impl Fn(f32, f32) -> f32,
     ) -> BraidResult<()> {
-        let [left, right] = expect_two_inputs(self.inputs.as_slice());
+        let (left, right) = expect_two_inputs(self.inputs.as_slice())?;
         packet.with_slices::<f32, _, _>([left, right, self.output], |buffers| {
             let [lhs, rhs, out] = buffers;
             for index in 0..out.len() {
@@ -789,14 +799,14 @@ fn compile_graph(
     let mut indegree = vec![0usize; graph.len()];
     let mut adjacency = vec![Vec::new(); graph.len()];
     for handle in graph.handles() {
-        let deps = collect_dependencies(&graph, handle);
+        let deps = collect_dependencies(&graph, handle)?;
         for dep in deps {
             adjacency[dep.index()].push(handle);
             indegree[handle.index()] += 1;
         }
     }
 
-    let final_handle = resolve_node(&graph, state.final_field.as_str());
+    let final_handle = resolve_node(&graph, state.final_field.as_str())?;
 
     let mut queue = VecDeque::new();
     for handle in graph.handles() {
@@ -814,6 +824,11 @@ fn compile_graph(
                 queue.push_back(child);
             }
         }
+    }
+    if sorted.len() != graph.len() {
+        return Err(BraidError::InvalidSpec(
+            "cycle detected in fastnoise graph".to_owned(),
+        ));
     }
 
     let mut next_slot = SLOT_DYNAMIC_START;
@@ -914,8 +929,8 @@ fn compile_graph(
                     &graph,
                     &position_slots_2,
                     base_position_slots_2(),
-                ),
-                output: expect_position_slots(position_slots_2.as_slice(), handle),
+                )?,
+                output: expect_position_slots(position_slots_2.as_slice(), handle)?,
                 noise: node.noise.clone(),
             }
             .encode(scratch),
@@ -925,8 +940,8 @@ fn compile_graph(
                     &graph,
                     &position_slots_3,
                     base_position_slots_3(),
-                ),
-                output: expect_position_slots(position_slots_3.as_slice(), handle),
+                )?,
+                output: expect_position_slots(position_slots_3.as_slice(), handle)?,
                 noise: node.noise.clone(),
             }
             .encode(scratch),
@@ -936,8 +951,8 @@ fn compile_graph(
                     &graph,
                     &position_slots_2,
                     base_position_slots_2(),
-                ),
-                output: expect_scalar_slot(scalar_slots.as_slice(), handle),
+                )?,
+                output: expect_scalar_slot(scalar_slots.as_slice(), handle)?,
                 noise: node.noise.clone(),
             }
             .encode(scratch),
@@ -947,21 +962,22 @@ fn compile_graph(
                     &graph,
                     &position_slots_3,
                     base_position_slots_3(),
-                ),
-                output: expect_scalar_slot(scalar_slots.as_slice(), handle),
+                )?,
+                output: expect_scalar_slot(scalar_slots.as_slice(), handle)?,
                 noise: node.noise.clone(),
             }
             .encode(scratch),
             NodeSpec::Combine(node) => {
+                validate_combine_contract(node.op, node.inputs.len(), node.params.len())?;
                 let mut inputs = Vec::with_capacity(node.inputs.len());
                 for input in &node.inputs {
-                    let input_handle = resolve_node(&graph, input.as_str());
-                    inputs.push(expect_scalar_slot(scalar_slots.as_slice(), input_handle));
+                    let input_handle = resolve_node(&graph, input.as_str())?;
+                    inputs.push(expect_scalar_slot(scalar_slots.as_slice(), input_handle)?);
                 }
                 CombinePayload {
                     op: node.op,
                     inputs,
-                    output: expect_scalar_slot(scalar_slots.as_slice(), handle),
+                    output: expect_scalar_slot(scalar_slots.as_slice(), handle)?,
                     params: node.params.clone(),
                 }
                 .encode(scratch)
@@ -977,25 +993,28 @@ fn compile_graph(
         static_buffers: Vec::new(),
         planner_meta: FastNoisePlannerMeta {
             dimension: state.dimension,
-            final_slot: expect_scalar_slot(scalar_slots.as_slice(), final_handle),
+            final_slot: expect_scalar_slot(scalar_slots.as_slice(), final_handle)?,
         },
     })
 }
 
-fn collect_dependencies(graph: &CompileNodes<'_>, handle: NodeHandle) -> Vec<NodeHandle> {
+fn collect_dependencies(
+    graph: &CompileNodes<'_>,
+    handle: NodeHandle,
+) -> BraidResult<Vec<NodeHandle>> {
     match graph.node(handle) {
-        NodeSpec::Warp2D(node) => position_source_dependency(&node.source, graph)
+        NodeSpec::Warp2D(node) => Ok(position_source_dependency(&node.source, graph)?
             .into_iter()
-            .collect(),
-        NodeSpec::Warp3D(node) => position_source_dependency(&node.source, graph)
+            .collect()),
+        NodeSpec::Warp3D(node) => Ok(position_source_dependency(&node.source, graph)?
             .into_iter()
-            .collect(),
-        NodeSpec::Sample2D(node) => position_source_dependency(&node.source, graph)
+            .collect()),
+        NodeSpec::Sample2D(node) => Ok(position_source_dependency(&node.source, graph)?
             .into_iter()
-            .collect(),
-        NodeSpec::Sample3D(node) => position_source_dependency(&node.source, graph)
+            .collect()),
+        NodeSpec::Sample3D(node) => Ok(position_source_dependency(&node.source, graph)?
             .into_iter()
-            .collect(),
+            .collect()),
         NodeSpec::Combine(node) => node
             .inputs
             .iter()
@@ -1007,10 +1026,10 @@ fn collect_dependencies(graph: &CompileNodes<'_>, handle: NodeHandle) -> Vec<Nod
 fn position_source_dependency(
     source: &PositionSource,
     graph: &CompileNodes<'_>,
-) -> Option<NodeHandle> {
+) -> BraidResult<Option<NodeHandle>> {
     match source {
-        PositionSource::Base => None,
-        PositionSource::Node(id) => Some(resolve_node(graph, id.as_str())),
+        PositionSource::Base => Ok(None),
+        PositionSource::Node(id) => Ok(Some(resolve_node(graph, id.as_str())?)),
     }
 }
 
@@ -1019,11 +1038,11 @@ fn resolve_position_source<const N: usize>(
     graph: &CompileNodes<'_>,
     position_slots: &[Option<PositionSlots<N>>],
     base_slots: PositionSlots<N>,
-) -> PositionSlots<N> {
+) -> BraidResult<PositionSlots<N>> {
     match source {
-        PositionSource::Base => base_slots,
+        PositionSource::Base => Ok(base_slots),
         PositionSource::Node(id) => {
-            let handle = resolve_node(graph, id.as_str());
+            let handle = resolve_node(graph, id.as_str())?;
             expect_position_slots(position_slots, handle)
         }
     }
@@ -1108,54 +1127,146 @@ pub(crate) fn summarize_samples(values: &[f32]) -> ChunkSummary {
     }
 }
 
-fn sample_count_2d(width: usize, height: usize) -> usize {
-    width * height
+fn sample_count_2d(width: usize, height: usize) -> BraidResult<u32> {
+    let width = checked_u32_from_usize(width, "query width")?;
+    let height = checked_u32_from_usize(height, "query height")?;
+    checked_mul_u32(width, height, "query sample count")
 }
 
-fn sample_count_3d(width: usize, height: usize, depth: usize) -> usize {
-    width * height * depth
+fn sample_count_3d(width: usize, height: usize, depth: usize) -> BraidResult<u32> {
+    let width = checked_u32_from_usize(width, "query width")?;
+    let height = checked_u32_from_usize(height, "query height")?;
+    let depth = checked_u32_from_usize(depth, "query depth")?;
+    checked_mul_u32(width, height, "intermediate query sample count")?
+        .checked_mul(depth)
+        .ok_or_else(|| BraidError::InvalidSpec("query sample count exceeds u32".to_owned()))
+}
+
+fn checked_u32_from_usize(value: usize, field: &str) -> BraidResult<u32> {
+    u32::try_from(value).map_err(|_| {
+        BraidError::InvalidSpec(format!("{field} exceeds u32 metadata range: {value}"))
+    })
+}
+
+fn checked_mul_u32(left: u32, right: u32, label: &str) -> BraidResult<u32> {
+    let left = left as u64;
+    let right = right as u64;
+    let product = left
+        .checked_mul(right)
+        .ok_or_else(|| BraidError::InvalidSpec(format!("{label} overflow")))?;
+    if product > u32::MAX as u64 {
+        return Err(BraidError::InvalidSpec(format!(
+            "{label} exceeds u32 metadata range: {product}"
+        )));
+    }
+    Ok(product as u32)
+}
+
+fn checked_offset_after_add(offset: u64, add: u32) -> BraidResult<u64> {
+    let next = offset
+        .checked_add(add as u64)
+        .ok_or_else(|| BraidError::InvalidSpec("chunk sample offset overflowed".to_owned()))?;
+    if next > u32::MAX as u64 {
+        return Err(BraidError::InvalidSpec(
+            "chunk sample offset exceeds u32 metadata range".to_owned(),
+        ));
+    }
+    Ok(next)
 }
 
 fn total_samples_from_offsets(offsets: &[u32]) -> usize {
     offsets.last().copied().unwrap_or(0) as usize
 }
 
-fn resolve_node(graph: &CompileNodes<'_>, id: &str) -> NodeHandle {
+fn resolve_node(graph: &CompileNodes<'_>, id: &str) -> BraidResult<NodeHandle> {
     let Some(handle) = graph.resolve(id) else {
-        panic!("missing node '{}'", id);
+        return Err(BraidError::InvalidSpec(format!("missing node '{}'", id)));
     };
-    handle
+    Ok(handle)
 }
 
 fn expect_position_slots<const N: usize>(
     slots: &[Option<PositionSlots<N>>],
     handle: NodeHandle,
-) -> PositionSlots<N> {
+) -> BraidResult<PositionSlots<N>> {
     let Some(slots) = slots[handle.index()] else {
-        panic!("missing position slots");
+        return Err(BraidError::InvalidSpec("missing position slots".to_owned()));
     };
-    slots
+    Ok(slots)
 }
 
-fn expect_scalar_slot(slots: &[Option<BufferSlot>], handle: NodeHandle) -> BufferSlot {
+fn expect_scalar_slot(slots: &[Option<BufferSlot>], handle: NodeHandle) -> BraidResult<BufferSlot> {
     let Some(slot) = slots[handle.index()] else {
-        panic!("missing scalar slot");
+        return Err(BraidError::InvalidSpec("missing scalar slot".to_owned()));
     };
-    slot
+    Ok(slot)
 }
 
-fn expect_two_inputs(inputs: &[BufferSlot]) -> [BufferSlot; 2] {
-    [inputs[0], inputs[1]]
+fn expect_two_inputs(inputs: &[BufferSlot]) -> BraidResult<(BufferSlot, BufferSlot)> {
+    let mut iter = inputs.iter();
+    let left = *iter.next().ok_or_else(|| {
+        BraidError::InvalidSpec("combine op expects 2 inputs, but got none".to_owned())
+    })?;
+    let right = *iter.next().ok_or_else(|| {
+        BraidError::InvalidSpec("combine op expects 2 inputs, but got only 1".to_owned())
+    })?;
+    if iter.next().is_some() {
+        return Err(BraidError::InvalidSpec(
+            "combine op expects 2 inputs, but got more than 2".to_owned(),
+        ));
+    }
+    Ok((left, right))
 }
 
-fn expect_input(inputs: &[BufferSlot]) -> BufferSlot {
-    inputs[0]
+fn expect_input(inputs: &[BufferSlot]) -> BraidResult<BufferSlot> {
+    let mut iter = inputs.iter();
+    let input = *iter.next().ok_or_else(|| {
+        BraidError::InvalidSpec("combine op expects 1 input, but got none".to_owned())
+    })?;
+    if iter.next().is_some() {
+        return Err(BraidError::InvalidSpec(
+            "combine op expects 1 input, but got more than 1".to_owned(),
+        ));
+    }
+    Ok(input)
 }
 
-fn expect_params<const N: usize>(params: &[f32]) -> [f32; N] {
+fn expect_params<const N: usize>(params: &[f32], op: CombineOp) -> BraidResult<[f32; N]> {
     let mut out = [0.0; N];
+    if params.len() != N {
+        return Err(BraidError::InvalidSpec(format!(
+            "combine op {:?} expects {N} parameters, got {}",
+            op,
+            params.len()
+        )));
+    }
     out.copy_from_slice(&params[..N]);
-    out
+    Ok(out)
+}
+
+fn validate_combine_contract(
+    op: CombineOp,
+    input_count: usize,
+    param_count: usize,
+) -> BraidResult<()> {
+    let (expected_inputs, expected_params) = match op {
+        CombineOp::Add | CombineOp::Sub | CombineOp::Mul | CombineOp::Min | CombineOp::Max => {
+            (2, 0)
+        }
+        CombineOp::Clamp => (1, 2),
+        CombineOp::Remap | CombineOp::YGradient => (1, 4),
+    };
+    if input_count != expected_inputs {
+        return Err(BraidError::InvalidSpec(format!(
+            "combine op {op:?} expects {expected_inputs} inputs, got {input_count}"
+        )));
+    }
+    if param_count != expected_params {
+        return Err(BraidError::InvalidSpec(format!(
+            "combine op {op:?} expects {expected_params} parameters, got {param_count}"
+        )));
+    }
+    Ok(())
 }
 
 macro_rules! enum_codec {
